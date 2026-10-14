@@ -2,6 +2,15 @@
 
 一个离线可用的「论坛体」小说排版工具。用写代码的方式管理楼层、马甲、时间线和导出结果，解决用记事本写论坛体时结构混乱、角色身份记不住、导出后排版全乱的痛点。
 
+## 下载
+
+已打包好的 Windows 版本见 [Releases](https://github.com/godwhycant/forum-writer/releases/latest)：
+
+- `ForumWriter-x.y.z-Setup.exe` —— 安装版（推荐）
+- `ForumWriter-x.y.z-Portable.exe` —— 便携版，免安装
+
+下载后即为中文界面，无需额外配置。也可直接克隆本仓库，按下方说明自行运行或打包。
+
 ## 功能
 
 - **楼层管理**：多楼层 + 楼中楼，拖拽排序，折叠成组
@@ -44,7 +53,7 @@ node node_modules/electron-builder/out/cli/cli.js --win
 node node_modules/electron-builder/out/cli/cli.js --win         # -> dist/*安装包.exe
 ```
 
-产物在 `dist/`（已在 `.gitignore` 中忽略）。
+产物在 `dist/`（已在 `.gitignore` 中忽略）。发布到 GitHub Releases 时，请将产物重命名为纯 ASCII 文件名（如 `ForumWriter-1.0.0-Setup.exe`）——中文文件名在 Release 资产上传时会被服务端截断。
 
 ### 图标
 
