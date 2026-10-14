@@ -1,0 +1,57 @@
+{
+  "name": "forum-writer",
+  "version": "1.0.0",
+  "description": "论坛体写作助手 —— 离线可用的论坛体排版工具",
+  "main": "main.js",
+  "author": "godwhycant <weiweierhong@outlook.com>",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist:dir": "electron-builder --win --dir"
+  },
+  "devDependencies": {
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.local.forumwriter",
+    "productName": "论坛体写作助手",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "index.html",
+      "style.css",
+      "app.js",
+      "main.js",
+      "build/icon.ico",
+      "build/icon.png"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false,
+      "artifactName": "${productName}-${version}-安装包.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "论坛体写作助手",
+      "deleteAppDataOnUninstall": false,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico"
+    }
+  }
+}
