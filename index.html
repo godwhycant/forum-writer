@@ -16,8 +16,9 @@
       <input id="workTitle" class="work-title" placeholder="作品标题…">
     </div>
     <div class="topbar-right">
-      <button id="btnNew" class="btn ghost" title="新建作品">新建</button>
-      <button id="btnImport" class="btn ghost" title="导入 json 存档">导入</button>
+      <button id="btnToAdmin" class="btn ghost">🧰 管理</button>
+      <button id="btnNew" class="btn ghost" title="新建空存档">新建</button>
+      <button id="btnImport" class="btn ghost" title="导入存档（整份合并 / 单帖追加）">导入</button>
       <button id="btnSettings" class="btn ghost" title="词库与设置">设置</button>
       <button id="btnExport" class="btn primary">导出 ▾</button>
       <div id="exportMenu" class="dropdown hidden">
@@ -25,14 +26,23 @@
         <a data-fmt="bbcode">BBCode (.txt)</a>
         <a data-fmt="txt">纯文本 (.txt)</a>
         <a data-fmt="html">HTML (.html)</a>
-        <a data-fmt="json" class="emph">项目存档 (.json) ← 可再导入</a>
+        <div class="dd-sep"></div>
+        <a data-fmt="json" class="emph">存档 (.json) ← 整个存档，可再导入</a>
+        <a data-fmt="post-json">仅当前帖子 (.json)</a>
         <div class="dd-sep"></div>
         <a data-fmt="copy-md">复制 Markdown 到剪贴板</a>
         <a data-fmt="copy-txt">复制纯文本到剪贴板</a>
       </div>
+      <button id="btnAbout" class="btn ghost ab-btn" title="关于 / 数据存放位置">?</button>
       <input type="file" id="fileInput" accept=".json" hidden>
     </div>
   </header>
+
+  <!-- 从管理视图进来时的返回条 -->
+  <div id="editorBar" class="editor-bar hidden">
+    <button id="btnBackAdmin" class="btn mini ghost">← 返回管理</button>
+    <span id="editorBarText" class="eb-text"></span>
+  </div>
 
   <div class="layout">
 
@@ -72,7 +82,50 @@
 
   </div>
 
+  <!-- 管理视图：版主后台（论坛目录 / 用户总览 / 版块） -->
+  <div id="adminView" class="admin hidden">
+    <header class="admin-bar">
+      <div class="admin-title">🧰 版主后台 <span class="admin-sub" id="adminSub"></span></div>
+      <div class="admin-tabs">
+        <button class="admin-tab active" data-tab="posts">帖子目录</button>
+        <button class="admin-tab" data-tab="users">用户总览</button>
+        <button class="admin-tab" data-tab="boards">版块管理</button>
+      </div>
+      <span class="admin-spacer"></span>
+      <button id="btnAdminNewPost" class="btn mini">＋ 新建帖子</button>
+      <button id="btnToEditor2" class="btn mini ghost">✍️ 回到写作</button>
+      <button id="btnExportAdmin" class="btn mini ghost" title="导出整个存档（可再导入）">存档 ▾</button>
+      <div id="adminExportMenu" class="dropdown hidden">
+        <a data-fmt="json" class="emph">导出存档 (.json)</a>
+        <a data-fmt="adj-json">导出目录（仅元数据）</a>
+        <a data-fmt="md">导出当前帖 Markdown</a>
+      </div>
+    </header>
+    <div class="admin-body">
+      <section id="adminTabPosts" class="admin-tab-panel"></section>
+      <section id="adminTabUsers" class="admin-tab-panel hidden"></section>
+      <section id="adminTabBoards" class="admin-tab-panel hidden"></section>
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
+</div>
+
+<!-- 关于 -->
+<div id="aboutModal" class="modal hidden">
+  <div class="modal-box">
+    <h3>关于 / 数据存放</h3>
+    <ul id="abStats" class="about-list"></ul>
+    <p class="about-p">
+      所有内容只存在本机浏览器的 <code>localStorage</code>（key：<code>forum-writer-project-v1</code>），
+      不会上传到任何服务器。<b>导出的 <code>.json</code> 存档是唯一官方备份</b>，其他格式为纯输出、不能再导入。
+    </p>
+    <p class="about-p">首次从 v1.0.x 升级时，旧存档已自动迁移，并另存了一份备份。</p>
+    <p id="abBackup" class="about-note"></p>
+    <div class="modal-actions">
+      <button id="abClose" class="btn primary">知道了</button>
+    </div>
+  </div>
 </div>
 
 <!-- 角色编辑弹窗 -->
@@ -137,10 +190,29 @@
         <option value="same">全部同一个人</option>
       </select>
     </label>
+    <label class="step-label">启动时进入
+      <select id="setStartView">
+        <option value="editor">写作界面（推荐）</option>
+        <option value="admin">版主后台（论坛目录）</option>
+      </select>
+    </label>
     <div class="modal-actions">
       <button id="setReset" class="btn ghost">恢复默认词库</button>
       <button id="setCancel" class="btn ghost">取消</button>
       <button id="setSave" class="btn primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 相关帖子 -->
+<div id="relatedModal" class="modal hidden">
+  <div class="modal-box">
+    <h3 id="relTitle">相关帖子</h3>
+    <p class="set-tip">勾选要在目录里互相引用的帖子（比如主线与番外）。</p>
+    <div id="relList" class="rel-list"></div>
+    <div class="modal-actions">
+      <button id="relCancel" class="btn ghost">取消</button>
+      <button id="relSave" class="btn primary">保存</button>
     </div>
   </div>
 </div>

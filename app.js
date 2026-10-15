@@ -3,43 +3,192 @@
   'use strict';
 
   const LS_KEY = 'forum-writer-project-v1';
+  const LS_BACKUP = 'forum-writer-backup-v1';
   const $ = (s) => document.querySelector(s);
   const $$ = (s) => Array.from(document.querySelectorAll(s));
   const PALETTE = ['#5b8def', '#e0654c', '#3bab8a', '#b06ad6', '#e8a53c', '#5d6b8a', '#d45d92', '#4aa3c7'];
 
   /* ---------- 数据模型 ---------- */
-  // project = {
-  //   title: string,
-  //   sortMode: 'manual' | 'time',
-  //   chars: [ {id, name, uid, avatar, color, title, note} ],
-  //   floors: [ {id, charId, content, time, replies:[{id,charId,toCharId,content}]} ]
-  // }
-  let P = load();
+  // 容器（存进 localStorage 的整体）
+  // forum = { app:'forum-writer', container:2, rootId, posts:[Post], ui:{startView, mode, activePostId} }
+  // Post  = { id, title, code, boardId, tags, createdAt, updatedAt, views, locked, mod, relatedIds,
+  //           sortMode, chars, floors, opFloorId, pinned, lex, timeStep, replyCollapseAt, imgMaxW }
+  // Char  = { id, name, uid, avatar, color, title, note, anon, op,
+  //           mod:{tag, note, warn, banned} }   // mod 仅管理视图可见，匿名角色也能看到真名
+  let F = load();               // 容器
+  let P = null;                 // 当前编辑的帖子（F.posts 里的引用，不是副本）
+  let view = 'editor';          // 'editor' | 'admin'
+
 
   function uid(p = 'id') {
     return p + '_' + Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-3);
   }
-  function blank() {
+  // 空帖子（写作层的最小单元）
+  function blankPost(title = '') {
     return {
-      app: 'forum-writer', version: 1,
-      title: '', sortMode: 'manual',
+      id: uid('p'),
+      title,
+      code: '',                                  // 版块内编号，展示为 #01
+      boardId: '',
+      tags: [],
+      createdAt: nowTime(),
+      updatedAt: nowTime(),
+      views: 0,
+      locked: false,
+      mod: { status: '', highlight: false, lockNote: '' },   // status: '' | '置顶' | '精华' | '归档'
+      relatedIds: [],
+      app: 'forum-writer', version: 2,
+      sortMode: 'manual',
       chars: [], floors: [],
       opFloorId: '',
-      // 置顶区：楼主帖 + 版规/公告，不参与楼层编号
       pinned: { op: true, opText: '', notices: [] },
-      // 词库：可在「设置」里编辑，存进项目随存档一起走
       lex: defaultLex(),
-      // 时间戳步进（分钟）：自动给新楼层分配时间
       timeStep: 2,
-      // 折叠类阈值
       replyCollapseAt: 3,
       imgMaxW: 640,
-      // 新建楼层的默认马甲
       newFloorChar: 'first',
-      // 批量回复：随机角色
       batchChar: 'random',
     };
   }
+  // 空容器
+  function blankForum() {
+    const p = blankPost('');
+    return {
+      app: 'forum-writer', version: 1, container: 2,
+      rootId: p.id,
+      posts: [p],
+      boards: defaultBoards(),
+      ui: { startView: 'editor', mode: 'editor', activePostId: p.id },
+    };
+  }
+  function defaultBoards() {
+    return [
+      { id: 'b_chat', name: '灌水闲聊' },
+      { id: 'b_help', name: '求助问答' },
+      { id: 'b_story', name: '故事连载' },
+      { id: 'b_review', name: '作品点评' },
+      { id: 'b_other', name: '其他' },
+    ];
+  }
+  function normalizeBoards(list) {
+    if (!Array.isArray(list) || !list.length) return defaultBoards();
+    const out = list.map((b, i) => (typeof b === 'string'
+      ? { id: 'b_' + i, name: b }
+      : { id: b && b.id ? String(b.id) : 'b_' + i, name: (b && b.name) ? String(b.name) : '未命名版块' }));
+    return out.length ? out : defaultBoards();
+  }
+
+  // 读取容器：兼容 v1 单帖存档，自动迁移并留备份
+  function load() {
+    let raw = null;
+    try { raw = localStorage.getItem(LS_KEY); } catch (e) { /* 忽略 */ }
+    if (!raw) return blankForum();
+    try { return adoptForum(JSON.parse(raw), { backupRaw: raw }); }
+    catch (e) { return blankForum(); }
+  }
+  // 把任意形态的数据（容器 / 单帖 / 裸对象）还原成容器
+  function adoptForum(raw, opts = {}) {
+    let data;
+    if (typeof raw === 'string') {
+      try { data = JSON.parse(raw); }
+      catch (e) {
+        // 不是 JSON：当作纯文本，一个帖子兜底
+        data = { title: '', chars: [], floors: [{ id: uid('f'), charId: '', content: raw, time: nowTime(), replies: [] }] };
+      }
+    } else data = raw;
+    if (!data || typeof data !== 'object') throw new Error('文件里没有可识别的内容');
+
+    let posts;
+    if (Array.isArray(data.posts) && data.posts.length) posts = data.posts.map(adoptPost);
+    else if (Array.isArray(data.floors)) {
+      // v1 单帖存档 → 迁移成容器里的第一个帖子，原数据留一份备份
+      if (opts.backupRaw) {
+        try { localStorage.setItem(LS_BACKUP, opts.backupRaw); } catch (e) { /* 忽略 */ }
+      }
+      posts = [adoptPost(data)];
+    } else throw new Error('文件里没有楼层数据');
+
+    const boards = normalizeBoards(data.boards);
+    const boardIds = new Set(boards.map(b => b.id));
+    posts.forEach(p => { if (!boardIds.has(p.boardId)) p.boardId = boards[0].id; });
+
+    const ui = Object.assign({ startView: 'editor', mode: 'editor', activePostId: '' }, data.ui || {});
+    if (!['editor', 'admin'].includes(ui.startView)) ui.startView = 'editor';
+    if (!['editor', 'admin'].includes(ui.mode)) ui.mode = 'editor';
+    const rootId = posts.some(p => p.id === data.rootId) ? data.rootId : posts[0].id;
+    if (!posts.some(p => p.id === ui.activePostId)) ui.activePostId = rootId;
+
+    return {
+      app: 'forum-writer', version: 1, container: 2,
+      rootId, posts, boards, ui,
+    };
+  }
+  function num(v, def) { return (typeof v === 'number' && isFinite(v)) ? v : def; }
+  function str(v, def) { return typeof v === 'string' ? v : (def === undefined ? '' : def); }
+  // 把存档里的一条帖子补全成规范结构（旧单帖存档直接喂进来也安全）
+  function adoptPost(raw) {
+    const p = Object.assign(blankPost(''), raw || {});
+    p.id = str(raw && raw.id) || uid('p');
+    p.title = str(raw && raw.title);
+    p.code = str(raw && raw.code);
+    p.boardId = str(raw && raw.boardId);
+    p.tags = (Array.isArray(raw && raw.tags) ? raw.tags : []).map(t => String(t).trim()).filter(Boolean).slice(0, 8);
+    p.createdAt = str(raw && raw.createdAt) || nowTime();
+    p.updatedAt = str(raw && raw.updatedAt) || p.createdAt;
+    p.views = Math.max(0, Math.floor(num(raw && raw.views, 0)));
+    p.locked = !!(raw && raw.locked);
+    const m = (raw && raw.mod) || {};
+    p.mod = {
+      status: ['', '置顶', '精华', '归档'].includes(m.status) ? m.status : '',
+      highlight: !!m.highlight,
+      lockNote: str(m.lockNote),
+    };
+    p.chars = (Array.isArray(raw && raw.chars) ? raw.chars : []).map(c => Object.assign(
+      { id: uid('c'), name: '未命名', uid: '', avatar: '', color: PALETTE[0], title: '', note: '', anon: false, op: false },
+      c,
+      {
+        id: str(c && c.id) || uid('c'),
+        anon: !!(c && c.anon),
+        op: !!(c && c.op),
+        mod: {
+          tag: str(c && c.mod && c.mod.tag),
+          note: str(c && c.mod && c.mod.note),
+          warn: !!(c && c.mod && c.mod.warn),
+          banned: !!(c && c.mod && c.mod.banned),
+        },
+      }));
+    const charIds = new Set(p.chars.map(c => c.id));
+    p.floors = (Array.isArray(raw && raw.floors) ? raw.floors : []).map(f => Object.assign(
+      { id: uid('f'), charId: '', content: '', time: nowTime(), replies: [], images: [], collapsed: false }, f,
+      {
+        images: Array.isArray(f && f.images) ? f.images : [],
+        collapsed: !!(f && f.collapsed),
+        replies: (Array.isArray(f && f.replies) ? f.replies : []).map(r => Object.assign(
+          { id: uid('r'), charId: '', toCharId: '', content: '', images: [] }, r,
+          { images: Array.isArray(r && r.images) ? r.images : [] })),
+      }));
+    // 允许悬空引用（渲染层有兜底），这里只做去重
+    void charIds;
+    p.lex = normalizeLex(p.lex);
+    p.pinned = normalizePinned(p.pinned);
+    p.sortMode = p.sortMode === 'time' ? 'time' : 'manual';
+    p.timeStep = Math.max(0, num(p.timeStep, 2));
+    p.replyCollapseAt = Math.max(1, num(p.replyCollapseAt, 3));
+    p.imgMaxW = Math.max(120, num(p.imgMaxW, 640));
+    p.opFloorId = str(p.opFloorId);
+    if (!['none', 'first', 'last', 'random'].includes(p.newFloorChar)) p.newFloorChar = 'first';
+    if (!['random', 'distinct', 'same'].includes(p.batchChar)) p.batchChar = 'random';
+    p.relatedIds = (Array.isArray(raw && raw.relatedIds) ? raw.relatedIds : []).filter(x => typeof x === 'string');
+    return p;
+  }
+  function postById(id) { return F.posts.find(p => p.id === id) || null; }
+  function activePost() { return postById(F.ui.activePostId) || F.posts[0]; }
+  function boardName(id) { const b = F.boards.find(b => b.id === id); return b ? b.name : '未分版'; }
+  function shortTime(str_) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(str_ || '');
+    return m ? `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}` : (str_ || '');
+  }
+
   function defaultLex() {
     return {
       pre: ['江湖', '深夜', '隔壁', '神秘', '孤独', '爱吃', '一只', '路过', '摸鱼', '家里', '远方', '沉默', '快乐', '佛系', '匿名', '热心', '不困', '爱睡', '元气', '摆烂'],
@@ -49,18 +198,6 @@
       title: ['LV.1 新手上路', 'LV.2 潜水员', 'LV.3 常驻居民', 'LV.5 活跃用户', 'LV.7 资深水友', 'LV.9 版主', 'LV.10 传说中的存在', '荣誉会员', '被封号过的人'],
       uidPre: ['yu', 'melon', 'user', 'moyu', 'passerby', 'fish', 'anon', 'typer', 'diving', 'night'],
     };
-  }
-  function load() {
-    try {
-      const raw = localStorage.getItem(LS_KEY);
-      if (raw) {
-        const d = JSON.parse(raw);
-        d.lex = normalizeLex(d.lex);
-        d.pinned = normalizePinned(d.pinned);
-        return Object.assign(blank(), d);
-      }
-    } catch (e) { /* 忽略损坏数据 */ }
-    return blank();
   }
   function normalizePinned(p) {
     p = p || {};
@@ -81,40 +218,12 @@
     });
     return out;
   }
-  // 把 JSON / 文本还原成工程对象，用于导入
-  function adoptProject(raw) {
-    let data;
-    if (typeof raw === 'string') {
-      try { data = JSON.parse(raw); }
-      catch (e) {
-        // 不是 JSON：当作纯文本，一个楼层兜底导入
-        data = { title: '', chars: [], floors: [{ id: uid('f'), charId: '', content: raw, time: nowTime(), replies: [] }] };
-      }
-    } else data = raw;
-    if (!data || !Array.isArray(data.floors)) throw new Error('文件里没有楼层数据');
-    // 补全字段，防止手工编辑过的存档缺字段
-    data.chars = (data.chars || []).map(c => Object.assign(
-      { id: uid('c'), name: '未命名', uid: '', avatar: '', color: '#5b8def', title: '', note: '', anon: false }, c));
-    data.floors = data.floors.map(f => Object.assign(
-      { id: uid('f'), charId: '', content: '', time: nowTime(), replies: [], images: [], collapsed: false }, f,
-      { images: f.images || [], collapsed: !!f.collapsed,
-        replies: (f.replies || []).map(r => Object.assign({ id: uid('r'), charId: '', toCharId: '', content: '', images: [] }, r, { images: r.images || [] })) }));
-    data.lex = normalizeLex(data.lex);
-    data.pinned = normalizePinned(data.pinned);
-    if (!data.sortMode) data.sortMode = 'manual';
-    if (typeof data.timeStep !== 'number') data.timeStep = 2;
-    if (typeof data.replyCollapseAt !== 'number') data.replyCollapseAt = 3;
-    if (typeof data.imgMaxW !== 'number') data.imgMaxW = 640;
-    if (typeof data.opFloorId !== 'string') data.opFloorId = '';
-    if (!['none', 'first', 'last', 'random'].includes(data.newFloorChar)) data.newFloorChar = 'first';
-    if (!['random', 'distinct', 'same'].includes(data.batchChar)) data.batchChar = 'random';
-    return Object.assign(blank(), data);
-  }
   let saveTimer = null;
   function save() {
+    if (P) P.updatedAt = nowTime();
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
-      try { localStorage.setItem(LS_KEY, JSON.stringify(P)); }
+      try { localStorage.setItem(LS_KEY, JSON.stringify(F)); }
       catch (e) { toast('保存失败：' + e.message); }
     }, 250);
   }
@@ -214,7 +323,8 @@
     const name = randomName() || '匿名用户';
     return {
       id: uid('c'), name, uid: randomUid(), avatar: name.slice(-1) || name.slice(0, 1),
-      color: randomColor(), title: pick(lexOf('title')), note: '', anon: false,
+      color: randomColor(), title: pick(lexOf('title')), note: '', anon: false, op: false,
+      mod: { tag: '', note: '', warn: false, banned: false },
     };
   }
   function randomUid() {
@@ -266,7 +376,7 @@
       note: $('#cNote').value.trim(),
     };
     if (editingCharId) Object.assign(charOf(editingCharId), data);
-    else P.chars.push(Object.assign({ id: uid('c') }, data));
+    else P.chars.push(Object.assign({ id: uid('c'), mod: { tag: '', note: '', warn: false, banned: false } }, data));
     save(); renderChars(); renderFloors(); renderPreview();
     $('#charModal').classList.add('hidden');
   }
@@ -933,12 +1043,29 @@
     });
     return html;
   }
+  function postMetaHTML() {
+    const chips = [];
+    const b = boardName(P.boardId);
+    if (b) chips.push(`<span class="p-badge board">${esc(b)}</span>`);
+    (P.tags || []).forEach(t => { if (t) chips.push(`<span class="p-badge tag">${esc(t)}</span>`); });
+    const m = P.mod || {};
+    if (P.locked) chips.push('<span class="p-badge lock">🔒 已锁定</span>');
+    if (m.highlight) chips.push('<span class="p-badge good">✦ 精华</span>');
+    if (m.status) chips.push(`<span class="p-badge status">${esc(m.status)}</span>`);
+    const rel = (P.relatedIds || []).map(id => F.posts.find(x => x.id === id)).filter(Boolean);
+    if (rel.length) {
+      chips.push(rel.map(r => `<span class="p-related">🔗 ${esc(r.title || r.code || '未命名')}</span>`).join(''));
+    }
+    if (!chips.length) return '';
+    return `<div class="p-badge-row">${chips.join('')}</div>`;
+  }
   function renderPreview() {
     const pv = $('#preview');
     const list = displayFloors();
     if (!list.length && !hasPinned()) { pv.innerHTML = '<p class="empty-tip">预览区</p>'; return; }
     let html = '';
     if (P.title) html += `<div class="p-title">${esc(P.title)}</div>`;
+    html += postMetaHTML();
     html += `<div class="p-sub">共 ${list.length} 楼 · 排序：${P.sortMode === 'time' ? '按时间' : '手动'}</div>`;
     html += pinnedPreviewHTML();
     list.forEach((f) => {
@@ -1112,16 +1239,27 @@ h1{font-size:20px}.floor{display:flex;gap:10px;padding:12px 0;border-bottom:1px 
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }
   function safeName() { return (P.title || '论坛体').replace(/[\\/:*?"<>|]/g, '_'); }
+  function safeForumName() {
+    const t = (F.posts.length === 1 ? P.title : '') || '论坛存档';
+    return t.replace(/[\\/:*?"<>|]/g, '_');
+  }
+  // 存档：整个容器（多帖 + 版块 + 角色备注），可再导入
+  function exportArchive() {
+    F.app = 'forum-writer'; F.version = 1; F.container = 2;
+    download(safeForumName() + '.json', JSON.stringify(F, null, 2), 'application/json');
+    toast(`已导出存档（${F.posts.length} 个帖子），可再次导入`);
+  }
   function exportAs(fmt) {
     if (!P.floors.length) { toast('还没有内容可导出'); return; }
     if (fmt === 'md') download(safeName() + '.md', toMarkdown(), 'text/markdown');
     else if (fmt === 'bbcode') download(safeName() + '.txt', toBBCode(), 'text/plain');
     else if (fmt === 'txt') download(safeName() + '.txt', toPlain(), 'text/plain');
     else if (fmt === 'html') download(safeName() + '.html', toHTMLFile(), 'text/html');
-    else if (fmt === 'json') {
-      P.app = 'forum-writer'; P.version = 1;
+    else if (fmt === 'json') { exportArchive(); return; }
+    else if (fmt === 'post-json') {
+      P.app = 'forum-writer'; P.version = 2;
       download(safeName() + '.json', JSON.stringify(P, null, 2), 'application/json');
-      toast('已导出存档，可再次导入');
+      toast('已导出当前帖子存档，可导入为新区块');
       return;
     }
     else if (fmt === 'copy-md') { copyText(toMarkdown()).then(() => toast('已复制 Markdown'), () => toast('复制失败')); return; }
@@ -1166,6 +1304,12 @@ h1{font-size:20px}.floor{display:flex;gap:10px;padding:12px 0;border-bottom:1px 
 
     $('#btnAddChar').addEventListener('click', () => openCharModal(null));
     $('#btnAddFloor').addEventListener('click', addFloor);
+
+    // 视图切换
+    $('#btnToAdmin').addEventListener('click', () => setView('admin'));
+    $('#btnAbout').addEventListener('click', openAbout);
+    $('#abClose').addEventListener('click', () => $('#aboutModal').classList.add('hidden'));
+    $('#aboutModal').addEventListener('click', e => { if (e.target.id === 'aboutModal') $('#aboutModal').classList.add('hidden'); });
 
     $('#btnPinToggle').addEventListener('click', () => {
       const p = P.pinned;
@@ -1213,8 +1357,10 @@ h1{font-size:20px}.floor{display:flex;gap:10px;padding:12px 0;border-bottom:1px 
 
     // 新建
     $('#btnNew').addEventListener('click', () => {
-      if (!confirm('新建将清空当前作品（建议先导出存档）。继续？')) return;
-      P = blank(); save(); renderAll();
+      if (!confirm('新建将清空当前所有帖子与角色（建议先导出存档）。继续？')) return;
+      F = blankForum();
+      P = F.posts[0];
+      save(); renderAll(); toast('已新建空存档');
     });
 
     // 角色弹窗
@@ -1223,7 +1369,7 @@ h1{font-size:20px}.floor{display:flex;gap:10px;padding:12px 0;border-bottom:1px 
     $('#cSave').addEventListener('click', saveChar);
     $('#charModal').addEventListener('click', e => { if (e.target.id === 'charModal') $('#charModal').classList.add('hidden'); });
     document.addEventListener('keydown', e => {
-      if (e.key === 'Escape') { $('#charModal').classList.add('hidden'); $('#setModal').classList.add('hidden'); }
+      if (e.key === 'Escape') { $('#charModal').classList.add('hidden'); $('#setModal').classList.add('hidden'); $('#aboutModal').classList.add('hidden'); }
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !$('#charModal').classList.contains('hidden')) saveChar();
     });
 
@@ -1263,6 +1409,7 @@ h1{font-size:20px}.floor{display:flex;gap:10px;padding:12px 0;border-bottom:1px 
     $('#setImgMaxW').value = P.imgMaxW;
     $('#setNewFloorChar').value = P.newFloorChar || 'first';
     $('#setBatchChar').value = P.batchChar || 'random';
+    $('#setStartView').value = F.ui.startView || 'editor';
     $('#setModal').classList.remove('hidden');
   }
   function fillLexForm(lex) {
@@ -1285,30 +1432,88 @@ h1{font-size:20px}.floor{display:flex;gap:10px;padding:12px 0;border-bottom:1px 
     P.newFloorChar = ['none', 'first', 'last', 'random'].includes(nfc) ? nfc : 'first';
     const bc = $('#setBatchChar').value;
     P.batchChar = ['random', 'distinct', 'same'].includes(bc) ? bc : 'random';
+    F.ui.startView = $('#setStartView').value === 'admin' ? 'admin' : 'editor';
     save(); $('#setModal').classList.add('hidden'); renderFloors(); renderPreview(); toast('设置已保存');
   }
 
+  // 导入：容器存档合并进来；单帖存档追加为一个新帖子
   function readArchive(file) {
     const reader = new FileReader();
     reader.onload = () => {
       try {
-        P = adoptProject(reader.result);
-        save(); renderAll(); toast('已导入「' + (P.title || '未命名') + '」');
+        const raw = reader.result;
+        const data = JSON.parse(raw);
+        if (data && Array.isArray(data.posts) && data.posts.length) {
+          const incoming = adoptForum(jsonClone(data));
+          const idMap = remapPostIds(incoming.posts);
+          incoming.posts.forEach(p => F.posts.push(p));
+          // relatedIds 里的旧 id 重映射到新 id，指不到就丢掉
+          incoming.posts.forEach(p => {
+            p.relatedIds = p.relatedIds.map(x => idMap.get(x)).filter(x => x && postById(x));
+          });
+          incoming.boards.forEach(b => { if (!F.boards.some(x => x.id === b.id)) F.boards.push(b); });
+          save(); renderAll();
+          toast(`已导入 ${incoming.posts.length} 个帖子，已合并到当前存档`);
+          return;
+        }
+        // 单帖（含 v1 旧存档）
+        const post = adoptPost(jsonClone(data));
+        post.id = uid('p');
+        post.relatedIds = [];
+        renameCollidingChars(post);
+        F.posts.push(post);
+        F.ui.activePostId = post.id;
+        save(); openPost(post.id);
+        toast('已导入「' + (post.title || '未命名') + '」');
       } catch (err) { toast('导入失败：' + err.message); }
     };
     reader.readAsText(file);
   }
+  function jsonClone(v) { return JSON.parse(JSON.stringify(v)); }
+  // 生成 旧 id → 新 id 的映射（导入整份存档时用）
+  function remapPostIds(posts) {
+    const map = new Map();
+    posts.forEach(p => { const old = p.id; p.id = uid('p'); map.set(old, p.id); });
+    return map;
+  }
+  // 单帖导入：角色 id 与现有角色冲突时换新 id，并改写楼层引用，避免串味
+  function renameCollidingChars(post) {
+    const used = new Set(F.posts.flatMap(p => p.chars.map(c => c.id)));
+    const map = new Map();
+    post.chars.forEach(c => {
+      if (!used.has(c.id)) return;
+      const nid = uid('c');
+      map.set(c.id, nid);
+      c.id = nid;
+    });
+    if (!map.size) return;
+    post.floors.forEach(f => {
+      if (map.has(f.charId)) f.charId = map.get(f.charId);
+      f.replies.forEach(r => {
+        if (map.has(r.charId)) r.charId = map.get(r.charId);
+        if (map.has(r.toCharId)) r.toCharId = map.get(r.toCharId);
+      });
+    });
+  }
 
   /* ---------- 示例数据（首次打开） ---------- */
-  function seedIfEmpty() {
-    if (P.floors.length || P.chars.length) return;
-    const c1 = { id: uid('c'), name: '江湖夜雨十年灯', uid: 'yu_8899', avatar: '夜', color: '#5b8def', title: 'LV.7 常驻居民', note: '老楼主，语气稳重' };
+  let seedPending = false;
+  function seedIfEmpty() { seedPending = !F.posts.some(p => p.floors.length || p.chars.length); }
+  function seedDemoPost() {
+    if (!seedPending || !F.posts.length) return;
+    seedPending = false;
+    const p = F.posts[0];
+    p.title = '【求助】有没有人遇到过这种情况？';
+    p.boardId = 'b_help';
+    p.tags = ['求助', '在线等'];
+    p.code = '001';
+    p.opFloorId = '';
+    p.createdAt = nowTime(-26 * 60);
+    const c1 = { id: uid('c'), name: '江湖夜雨十年灯', uid: 'yu_8899', avatar: '夜', color: '#5b8def', title: 'LV.7 常驻居民', note: '老楼主，语气稳重', anon: false, op: true };
     const c2 = { id: uid('c'), name: '吃瓜第一线', uid: 'melon_233', avatar: '瓜', color: '#e0654c', title: 'LV.3 潜水员', note: '爱吐槽，短句' };
     const c3 = { id: uid('c'), name: '我是分析帝', uid: 'analyst_01', avatar: '析', color: '#3bab8a', title: 'LV.9 版主', note: '长篇分析，爱用序号' };
-    P.chars = [c1, c2, c3];
-    P.title = '【求助】有没有人遇到过这种情况？';
-    P.opFloorId = '';
-    P.pinned = {
+    p.chars = [c1, c2, c3].map(c => Object.assign({ op: false, anon: false, note: '', mod: { tag: '', note: '', warn: false, banned: false } }, c));
+    p.pinned = {
       op: true,
       opTitle: '【求助】有没有人遇到过这种情况？',
       opText: '楼主：事情是这样的……在线等，挺急的。\n补充：已在楼下贴图，麻烦大家帮忙看看。',
@@ -1316,23 +1521,454 @@ h1{font-size:20px}.floor{display:flex;gap:10px;padding:12px 0;border-bottom:1px 
         { id: uid('n'), kind: '版规', title: '本版发帖须知', content: '禁止水帖、人身攻击；求助帖请补充时间地点与截图。' },
       ],
     };
-    P.floors = [
-      { id: uid('f'), charId: c1.id, time: nowTime(0), content: '事情是这样的……在线等，挺急的。', replies: [
+    p.floors = [
+      { id: uid('f'), charId: c1.id, time: nowTime(-26 * 60), content: '事情是这样的……在线等，挺急的。', replies: [
         { id: uid('r'), charId: c2.id, toCharId: '', content: '沙发！先占楼' },
         { id: uid('r'), charId: c3.id, toCharId: c1.id, content: '1. 先说清时间地点\n2. 有没有截图？' },
       ] },
-      { id: uid('f'), charId: c2.id, time: nowTime(3), content: '蹲一个后续，感觉有大瓜', replies: [] },
+      { id: uid('f'), charId: c2.id, time: nowTime(-26 * 60 + 3), content: '蹲一个后续，感觉有大瓜', replies: [] },
     ];
+  }
+  // 初始渲染时按需注入示例数据：只在用户什么都没写时才填，
+  // 避免「点进管理视图 → 依赖渲染抛出 null → 控制台报错」的连锁问题
+  function ensureSeed() {
+    if (!seedPending) return;
+    if (F.posts.some(p => p.floors.length)) { seedPending = false; return; }
+    seedDemoPost();
     save();
+  }
+
+  /* ---------- 管理视图（版主后台） ---------- */
+  let adminTab = 'posts';
+  let adminBoardFilter = '';
+  let adminUserQuery = '';
+  let lastTabClick = { key: '', at: 0 };
+
+  function bindAdmin() {
+    $('#btnBackAdmin').addEventListener('click', () => setView('admin'));
+    $('#btnToEditor2').addEventListener('click', () => setView('editor'));
+    $('#btnAdminNewPost').addEventListener('click', () => createPost());
+    $('#relCancel').addEventListener('click', () => $('#relatedModal').classList.add('hidden'));
+    $('#relSave').addEventListener('click', saveRelated);
+    $('#relatedModal').addEventListener('click', e => { if (e.target.id === 'relatedModal') $('#relatedModal').classList.add('hidden'); });
+    $$('.admin-tab').forEach(b => b.addEventListener('click', () => {
+      adminTab = b.dataset.tab;
+      syncAdminTabs();
+      renderAdmin();
+    }));
+    const am = $('#adminExportMenu');
+    $('#btnExportAdmin').addEventListener('click', e => { e.stopPropagation(); am.classList.toggle('hidden'); });
+    am.querySelectorAll('a').forEach(a => a.addEventListener('click', () => {
+      const fmt = a.dataset.fmt;
+      am.classList.add('hidden');
+      if (fmt === 'json') exportArchive();
+      else if (fmt === 'adj-json') exportAdjacency();
+      else if (fmt === 'md') exportAs('md');
+    }));
+    document.addEventListener('click', () => am.classList.add('hidden'));
+  }
+  // 目录导出：只留标题 / 版块 / 标签 / 关联，方便用文本编辑器规划长篇结构
+  function exportAdjacency() {
+    const data = {
+      app: 'forum-writer', kind: 'outline', version: 1,
+      boards: F.boards,
+      posts: displayPosts().map(p => ({
+        code: p.code, title: p.title, board: boardName(p.boardId), tags: p.tags,
+        floors: p.floors.length, replies: p.floors.reduce((s, f) => s + f.replies.length, 0),
+        related: p.relatedIds.map(id => { const q = postById(id); return q ? q.title : null; }).filter(Boolean),
+      })),
+    };
+    download(safeForumName() + '-目录.json', JSON.stringify(data, null, 2), 'application/json');
+    toast('已导出目录（可再导入的存档请用「导出存档」）');
+  }
+
+  function renderAdmin() {
+    const totalFloors = F.posts.reduce((s, p) => s + p.floors.length, 0);
+    const totalChars = F.posts.reduce((s, p) => s + p.chars.length, 0);
+    $('#adminSub').textContent = `${F.posts.length} 帖 · ${totalFloors} 楼 · ${totalChars} 个角色`;
+    if (adminTab === 'posts') renderAdminPosts();
+    else if (adminTab === 'users') renderAdminUsers();
+    else renderAdminBoards();
+  }
+
+  function displayPosts() {
+    return [...F.posts].sort((a, b) => {
+      const rank = p => (p.mod.status === '置顶' ? 0 : p.id === F.rootId ? 1 : 2);
+      if (rank(a) !== rank(b)) return rank(a) - rank(b);
+      return (b.updatedAt || '').localeCompare(a.updatedAt || '');
+    });
+  }
+
+  function postRowHTML(p) {
+    const dis = p === P ? '' : ' disabled';
+    const op = p.chars.find(c => c.op);
+    return `<div class="post-row${p === P ? ' is-active' : ''}" data-id="${p.id}">
+      <div class="pr-main">
+        <div class="pr-title">
+          ${p.mod.status ? `<span class="badge ${p.mod.status === '置顶' ? 'hot' : p.mod.status === '精华' ? 'good' : ''}">${esc(p.mod.status)}</span>` : ''}
+          ${p.mod.highlight ? '<span class="badge star">高亮</span>' : ''}
+          ${p.id === F.rootId ? '<span class="badge root">主帖</span>' : ''}
+          <input class="pr-title-in" data-act="title" value="${esc(p.title)}" placeholder="（未命名帖子）">
+        </div>
+        <div class="pr-meta">
+          <span class="tag-chip">${esc(boardName(p.boardId))}</span>
+          ${p.tags.map(t => `<span class="tag-chip tag-minor">${esc(t)}</span>`).join('')}
+          <span class="pr-num">${p.floors.length} 楼 / ${p.floors.reduce((s, f) => s + f.replies.length, 0)} 回复</span>
+          <span class="pr-num">${p.chars.length} 角色</span>
+          <span class="pr-num">更新 ${esc(shortTime(p.updatedAt))}</span>
+        </div>
+      </div>
+      <div class="pr-side">
+        <label class="mini-field">编号<input data-act="code" value="${esc(p.code)}" placeholder="001"></label>
+        <label class="mini-field">版块<select data-act="board">${F.boards.map(b =>
+          `<option value="${esc(b.id)}"${b.id === p.boardId ? ' selected' : ''}>${esc(b.name)}</option>`).join('')}</select></label>
+        <label class="mini-field wide">标签<input data-act="tags" value="${esc(p.tags.join(' '))}" placeholder="用空格分隔"></label>
+        <label class="mini-field">状态<select data-act="status">${['', '置顶', '精华', '归档'].map(s =>
+          `<option value="${s}"${s === p.mod.status ? ' selected' : ''}>${s || '普通'}</option>`).join('')}</select></label>
+      </div>
+      <div class="pr-ops">
+        <button class="btn mini" data-act="open"${dis} title="${dis ? '当前正在写这一帖' : '用写作界面打开这一帖'}">✍️ 写这篇</button>
+        <button class="btn mini ghost" data-act="related" title="设置相关帖子（用于目录内互链）">🔗 相关 ${p.relatedIds.length || ''}</button>
+        <button class="btn mini ghost" data-act="standalone" title="把这一帖导出为单帖存档，方便单独分享">单独导出</button>
+        <button class="btn mini ghost" data-act="lock" title="锁帖：锁上后写作界面只读，防止误改">${p.locked ? '🔒 已锁' : '🔓 锁帖'}</button>
+        <button class="btn mini ghost" data-act="dup" title="复制这一帖">复制</button>
+        <button class="btn mini ghost" data-act="root" title="标记为主帖">${p.id === F.rootId ? '★ 主帖' : '☆ 设主帖'}</button>
+        <button class="btn mini ghost" data-act="del">删除</button>
+      </div>
+    </div>`;
+  }
+
+  function renderAdminPosts() {
+    const box = $('#adminTabPosts');
+    const list = displayPosts().filter(p => !adminBoardFilter || p.boardId === adminBoardFilter);
+    const chips = [`<button class="chip${adminBoardFilter ? '' : ' active'}" data-board="">全部 ${F.posts.length}</button>`]
+      .concat(F.boards.map(b => {
+        const n = F.posts.filter(p => p.boardId === b.id).length;
+        return `<button class="chip${adminBoardFilter === b.id ? ' active' : ''}" data-board="${b.id}">${esc(b.name)} ${n}</button>`;
+      })).join('');
+    box.innerHTML = `
+      <div class="admin-toolbar">${chips}
+        <span class="admin-spacer"></span>
+        <span class="hint-inline">标注「主帖」的那篇就是长篇正文，其余帖子可以当番外、废稿或目录占位</span>
+      </div>
+      <div class="post-list">${list.length ? list.map(postRowHTML).join('') : '<p class="empty-tip">这个版块下还没有帖子。</p>'}</div>`;
+
+    box.querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => {
+      adminBoardFilter = c.dataset.board;
+      renderAdmin();
+    }));
+    box.querySelectorAll('[data-act="title"]').forEach(inp => {
+      inp.addEventListener('input', () => { const p = postById(inp.closest('.post-row').dataset.id); p.title = inp.value; save(); });
+      inp.addEventListener('change', () => renderAdmin());
+    });
+    box.querySelectorAll('[data-act="code"]').forEach(inp => inp.addEventListener('input', () => {
+      postById(inp.closest('.post-row').dataset.id).code = inp.value.trim(); save();
+    }));
+    box.querySelectorAll('[data-act="tags"]').forEach(inp => inp.addEventListener('change', () => {
+      const p = postById(inp.closest('.post-row').dataset.id);
+      p.tags = inp.value.split(/[\s,，]+/).map(s => s.trim()).filter(Boolean).slice(0, 8);
+      save(); renderAdmin();
+    }));
+    box.querySelectorAll('[data-act="board"]').forEach(sel => sel.addEventListener('change', () => {
+      postById(sel.closest('.post-row').dataset.id).boardId = sel.value; save(); renderAdmin();
+    }));
+    box.querySelectorAll('[data-act="status"]').forEach(sel => sel.addEventListener('change', () => {
+      postById(sel.closest('.post-row').dataset.id).mod.status = sel.value; save(); renderAdmin();
+    }));
+    box.querySelectorAll('.post-row').forEach(row => {
+      const p = postById(row.dataset.id);
+      row.querySelectorAll('.pr-ops [data-act]').forEach(b => b.addEventListener('click', () => {
+        const act = b.dataset.act;
+        if (act === 'open') openFromAdmin(p.id);
+        else if (act === 'standalone') exportPostStandalone(p.id);
+        else if (act === 'related') openRelatedModal(p.id);
+        else if (act === 'del') deletePost(p.id);
+        else if (act === 'dup') { const c = duplicatePost(p.id); save(); renderAdmin(); toast('已复制为「' + c.title + '」'); }
+        else if (act === 'root') { F.rootId = p.id; save(); renderAdmin(); toast('已标记为主帖'); }
+        else if (act === 'lock') { p.locked = !p.locked; save(); renderAdmin(); toast(p.locked ? '已锁帖' : '已解锁'); if (p === P) applyLockState(); }
+      }));
+      // 双击标题行 → 直接开始写这一帖
+      row.addEventListener('dblclick', e => { if (e.target.tagName !== 'INPUT' && e.target.tagName !== 'SELECT') openFromAdmin(p.id); });
+    });
+  }
+
+  function openFromAdmin(id) {
+    const p = postById(id);
+    if (!p || p.locked) { toast('这一帖已锁，先解锁再写'); return; }
+    openPost(id);
+  }
+  function exportPostStandalone(id) {
+    const p = postById(id);
+    const data = jsonClone(p);
+    data.app = 'forum-writer'; data.version = 2;
+    const name = (p.title || '帖子').replace(/[\\/:*?"<>|]/g, '_');
+    download(name + '.json', JSON.stringify(data, null, 2), 'application/json');
+    toast('已单独导出这一帖，可再次导入');
+  }
+  function duplicatePost(id) {
+    const src = postById(id);
+    const c = adoptPost(jsonClone(src));
+    c.id = uid('p');
+    c.title = (src.title || '未命名') + '（副本）';
+    c.code = '';
+    c.mod = { status: '', highlight: false, lockNote: '' };
+    c.createdAt = c.updatedAt = nowTime();
+    renameCollidingChars(c);
+    F.posts.push(c);
+    return c;
+  }
+  function createPost(title = '') {
+    const p = blankPost(title);
+    p.boardId = (F.boards[0] || { id: '' }).id;
+    p.relatedIds = [];
+    F.posts.push(p);
+    save(); adminTab = 'posts'; syncAdminTabs(); renderAdmin();
+    toast('已新建帖子，点「✍️ 写这篇」开始');
+    return p;
+  }
+  function syncAdminTabs() {
+    $$('.admin-tab').forEach(x => x.classList.toggle('active', x.dataset.tab === adminTab));
+    $('#adminTabPosts').classList.toggle('hidden', adminTab !== 'posts');
+    $('#adminTabUsers').classList.toggle('hidden', adminTab !== 'users');
+    $('#adminTabBoards').classList.toggle('hidden', adminTab !== 'boards');
+  }
+  // 双击确认：第一次点只是提示，两秒内再点一次才真的删
+  function needConfirm(key, msg) {
+    const now = Date.now();
+    if (lastTabClick.key === key && now - lastTabClick.at < 2500) { lastTabClick = { key: '', at: 0 }; return true; }
+    lastTabClick = { key, at: now };
+    toast(msg);
+    return false;
+  }
+  function deletePost(id) {
+    if (F.posts.length <= 1) { toast('至少要保留一个帖子'); return; }
+    const p = postById(id);
+    F.posts = F.posts.filter(x => x.id !== id);
+    F.posts.forEach(x => { x.relatedIds = x.relatedIds.filter(r => r !== id); });
+    if (F.rootId === id) F.rootId = F.posts[0].id;
+    if (F.ui.activePostId === id) { F.ui.activePostId = F.posts[0].id; P = F.posts[0]; }
+    save(); renderAdmin(); toast(`已删除「${p.title || '未命名'}」`);
+  }
+
+  /* 相关帖子（目录内互链） */
+  let relatedPostId = null;
+  function openRelatedModal(id) {
+    relatedPostId = id;
+    const p = postById(id);
+    $('#relTitle').textContent = '相关帖子 —— ' + (p.title || '未命名');
+    const others = F.posts.filter(x => x.id !== id);
+    $('#relList').innerHTML = others.length ? others.map(x =>
+      `<label class="rel-item"><input type="checkbox" value="${x.id}"${p.relatedIds.includes(x.id) ? ' checked' : ''}>
+        <span>${esc(x.title || '（未命名）')}</span><span class="rel-board">${esc(boardName(x.boardId))}</span></label>`).join('')
+      : '<p class="empty-tip">还没有别的帖子可以关联。</p>';
+    $('#relatedModal').classList.remove('hidden');
+  }
+  function saveRelated() {
+    const p = postById(relatedPostId);
+    if (!p) return;
+    p.relatedIds = $$('#relList input:checked').map(i => i.value).filter(x => x !== p.id && postById(x));
+    save(); $('#relatedModal').classList.add('hidden'); renderAdmin();
+    toast('已保存相关帖子' + (p.relatedIds.length ? `（${p.relatedIds.length} 条）` : ''));
+  }
+
+  /* 用户总览：跨帖的角色列表，匿名也能看到真名（这是版主视角才有的） */
+  function charKey(c) { return (c.uid || '').trim() || ('name:' + (c.name || '').trim()); }
+  function collectAllChars() {
+    const map = new Map();
+    F.posts.forEach(p => p.chars.forEach(c => {
+      const key = charKey(c);
+      let e = map.get(key);
+      if (!e) {
+        e = {
+          key, name: c.name, uid: c.uid, avatar: c.avatar, color: c.color, title: c.title, note: c.note,
+          anon: !!c.anon, op: false, mod: { tag: '', note: '', warn: false, banned: false },
+          posts: [], floors: 0, replies: 0, last: '',
+        };
+        map.set(key, e);
+      }
+      e.op = e.op || !!c.op;
+      if (!e.avatar && c.avatar) e.avatar = c.avatar;
+      if (!e.color && c.color) e.color = c.color;
+      if (!e.note && c.note) e.note = c.note;
+      e.anon = e.anon || !!c.anon;
+      ['tag', 'note'].forEach(k => { if (!e.mod[k] && c.mod && c.mod[k]) e.mod[k] = c.mod[k]; });
+      if (c.mod) { e.mod.warn = e.mod.warn || !!c.mod.warn; e.mod.banned = e.mod.banned || !!c.mod.banned; }
+      if (!e.posts.includes(p.title)) e.posts.push(p.title || '（未命名）');
+      const my = new Set([c.id]);
+      p.floors.forEach(f => {
+        if (f.charId === c.id) { e.floors++; if ((f.time || '') > e.last) e.last = f.time || ''; }
+        f.replies.forEach(r => { if (r.charId === c.id) e.replies++; });
+      });
+      void my;
+    }));
+    return [...map.values()].sort((a, b) => (b.floors + b.replies) - (a.floors + a.replies));
+  }
+  function renderAdminUsers() {
+    const box = $('#adminTabUsers');
+    const all = collectAllChars();
+    const q = adminUserQuery.trim().toLowerCase();
+    const list = q ? all.filter(c => `${c.name}\u0000${c.uid}`.toLowerCase().includes(q)) : all;
+    box.innerHTML = `
+      <div class="admin-toolbar">
+        <input id="userSearch" class="user-search" placeholder="搜索昵称或 ID…" value="${esc(adminUserQuery)}">
+        <span class="hint-inline">共 ${all.length} 个角色（按 uid 去重）。匿名角色在这里能看到真名，导出时依然保持匿名。</span>
+      </div>
+      <div class="user-list">${list.length ? list.map(userRowHTML).join('') : '<p class="empty-tip">没有匹配的角色。</p>'}</div>`;
+    const search = $('#userSearch');
+    search.addEventListener('input', () => {
+      adminUserQuery = search.value;
+      renderAdminUsers();
+      const s = $('#userSearch');
+      s.focus(); s.setSelectionRange(s.value.length, s.value.length);
+    });
+    box.querySelectorAll('.user-head').forEach(h => h.addEventListener('click', () => {
+      h.parentElement.classList.toggle('open');
+    }));
+    box.querySelectorAll('[data-uact]').forEach(inp => {
+      const key = inp.dataset.key;
+      const act = inp.dataset.uact;
+      const handler = () => {
+        const e = all.find(x => x.key === key);
+        if (!e) return;
+        if (act === 'tag') e.mod.tag = inp.value.trim();
+        else if (act === 'note') e.mod.note = inp.value.trim();
+        else if (act === 'warn') e.mod.warn = inp.checked;
+        else if (act === 'banned') e.mod.banned = inp.checked;
+        // 写回所有同 key 的角色：同名/同 ID 视为同一个人
+        F.posts.forEach(p => p.chars.forEach(c => { if (charKey(c) !== key) return; c.mod = c.mod || {}; c.mod.tag = e.mod.tag; c.mod.note = e.mod.note; c.mod.warn = e.mod.warn; c.mod.banned = e.mod.banned; }));
+        save();
+        if (act === 'warn' || act === 'banned') renderAdminUsers();
+      };
+      inp.addEventListener(act === 'tag' || act === 'note' ? 'input' : 'change', handler);
+    });
+  }
+  function userRowHTML(c) {
+    const acts = (c.floors + c.replies);
+    return `<div class="user-row${c.mod.banned ? ' banned' : ''}">
+      <div class="user-head">
+        <div class="avatar" style="background:${esc(c.color || '#9aa3b2')}">${esc(c.avatar || (c.name || '?').slice(0, 1))}</div>
+        <div class="user-main">
+          <div class="user-name">${esc(c.name)}
+            ${c.mod.banned ? '<span class="badge ban">封禁</span>' : ''}
+            ${c.mod.warn ? '<span class="badge warn">警告</span>' : ''}
+            ${c.op ? '<span class="op-tag">楼主</span>' : ''}
+            ${c.anon ? '<span class="anon-tag">匿名</span>' : ''}
+            ${c.mod.tag ? `<span class="badge tag">${esc(c.mod.tag)}</span>` : ''}</div>
+          <div class="user-sub">@${esc(c.uid || 'anonymous')} · ${esc(c.title || '无头衔')} · 出现 ${c.posts.length} 帖 · ${c.floors} 楼 / ${c.replies} 回复${c.last ? ' · 最后 ' + esc(shortTime(c.last)) : ''}</div>
+        </div>
+        <span class="user-toggle">▾</span>
+      </div>
+      <div class="user-detail">
+        ${c.note ? `<div class="ud-note">人设：${esc(c.note)}</div>` : ''}
+        <div class="ud-posts">出现于：${c.posts.map(esc).join('、')}</div>
+        <div class="ud-edit">
+          <label class="mini-field">版主标签<input data-uact="tag" data-key="${esc(c.key)}" value="${esc(c.mod.tag)}" placeholder="如：老水军 / 疑似小号"></label>
+          <label class="mini-field wide">版主备注<textarea data-uact="note" data-key="${esc(c.key)}" rows="2" placeholder="只有管理视图能看到，导出时不会带上">${esc(c.mod.note)}</textarea></label>
+          <label class="check-row"><input type="checkbox" data-uact="warn" data-key="${esc(c.key)}"${c.mod.warn ? ' checked' : ''}> <span>标记警告</span></label>
+          <label class="check-row"><input type="checkbox" data-uact="banned" data-key="${esc(c.key)}"${c.mod.banned ? ' checked' : ''}> <span>标记封禁</span></label>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  /* 版块管理 */
+  function renderAdminBoards() {
+    const box = $('#adminTabBoards');
+    box.innerHTML = `
+      <div class="admin-toolbar"><span class="hint-inline">版块只是给帖子分类，方便在目录里筛选。</span></div>
+      <div class="board-list">
+        ${F.boards.map(b => {
+          const n = F.posts.filter(p => p.boardId === b.id).length;
+          return `<div class="board-row" data-id="${esc(b.id)}">
+            <input class="board-name" data-bact="name" value="${esc(b.name)}">
+            <span class="pr-num">${n} 帖</span>
+            <button class="btn mini ghost" data-bact="del">删除</button>
+          </div>`;
+        }).join('')}
+      </div>
+      <div class="board-add"><input id="newBoardName" class="board-name" placeholder="新版块名称…"><button id="btnAddBoard" class="btn mini">＋ 添加版块</button></div>`;
+    box.querySelectorAll('[data-bact="name"]').forEach(inp => {
+      const b = F.boards.find(x => x.id === inp.closest('.board-row').dataset.id);
+      inp.addEventListener('change', () => { b.name = inp.value.trim() || b.name; save(); renderAdmin(); });
+    });
+    box.querySelectorAll('[data-bact="del"]').forEach(btn => btn.addEventListener('click', () => {
+      const id = btn.closest('.board-row').dataset.id;
+      if (F.boards.length <= 1) { toast('至少要保留一个版块'); return; }
+      F.boards = F.boards.filter(x => x.id !== id);
+      const rest = F.boards[0].id;
+      F.posts.forEach(p => { if (p.boardId === id) p.boardId = rest; });
+      save(); renderAdmin(); toast('已删除版块，原帖已并入「' + F.boards[0].name + '」');
+    }));
+    const add = () => {
+      const name = $('#newBoardName').value.trim();
+      if (!name) { toast('请填写版块名称'); return; }
+      F.boards.push({ id: uid('b'), name });
+      save(); renderAdmin(); toast('已添加版块「' + name + '」');
+    };
+    $('#btnAddBoard').addEventListener('click', add);
+    $('#newBoardName').addEventListener('keydown', e => { if (e.key === 'Enter') add(); });
+  }
+
+  function applyLockState() {
+    const locked = !!P.locked;
+    const btn = $('#btnAddFloor');
+    btn.disabled = locked;
+    $$('.panel-center textarea, .panel-center select, .panel-center button, .pin-body input, .pin-body textarea')
+      .forEach(el => { el.disabled = locked; });
+    const bar = $('#editorBar');
+    bar.classList.toggle('hidden', !locked && !bar.dataset.fromAdmin);
+    if (locked) {
+      bar.classList.remove('hidden');
+      $('#editorBarText').textContent = '这一帖已在管理视图锁定，为避免误改暂时只读；点「← 返回管理」可解锁。';
+    }
   }
 
   /* ---------- 启动 ---------- */
   function renderAll() {
+    const fromAdmin = view === 'editor' && F.ui.mode === 'admin';
     $('#workTitle').value = P.title || '';
     $('#btnToggleTime').textContent = '排序：' + (P.sortMode === 'time' ? '按时间' : '手动');
+    const bar = $('#editorBar');
+    bar.dataset.fromAdmin = fromAdmin ? '1' : '';
+    bar.classList.toggle('hidden', !fromAdmin && !P.locked);
+    if (fromAdmin) $('#editorBarText').textContent = `正在写：${P.title || '（未命名帖子）'} · ${boardName(P.boardId)}`;
     renderChars(); renderPin(); renderFloors(); renderPreview();
+    applyLockState();
+  }
+  // 视图切换：写作（三栏编辑器）/ 管理（版主后台）
+  function setView(v) {
+    view = v === 'admin' ? 'admin' : 'editor';
+    F.ui.mode = view;
+    $('#app').classList.toggle('hidden', view !== 'editor');
+    $('#adminView').classList.toggle('hidden', view !== 'admin');
+    if (view === 'editor') renderAll();
+    else renderAdmin();
+    save();
+  }
+  function openPost(id) {
+    const p = postById(id);
+    if (!p) return;
+    P = p;                         // P 是 F.posts 里的同一个对象引用
+    F.ui.activePostId = id;
+    setView('editor');
+  }
+  function openAbout() {
+    const b = $('#aboutModal');
+    const nf = (localStorage.getItem(LS_KEY) || '').length;
+    b.querySelector('#abStats').innerHTML =
+      `<li>帖子：${F.posts.length} 个</li>
+       <li>版块：${F.boards.length} 个</li>
+       <li>角色（按帖统计，含重复）：${F.posts.reduce((s, p) => s + p.chars.length, 0)} 个</li>
+       <li>楼层合计：${F.posts.reduce((s, p) => s + p.floors.length, 0)} 层</li>
+       <li>本地存档体积：约 ${(nf / 1024).toFixed(1)} KB</li>`;
+    b.querySelector('#abBackup').textContent = localStorage.getItem(LS_BACKUP)
+      ? '（已保留 v1.0.x 旧存档备份，恢复方式见 README）' : '';
+    b.classList.remove('hidden');
   }
   seedIfEmpty();
   bindTop();
-  renderAll();
+  bindAdmin();
+  P = activePost();
+  ensureSeed();
+  setView(F.ui.startView === 'admin' ? 'admin' : 'editor');
 })();
