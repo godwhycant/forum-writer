@@ -18,6 +18,7 @@
   let F = load();               // 容器
   let P = null;                 // 当前编辑的帖子（F.posts 里的引用，不是副本）
   let view = 'editor';          // 'editor' | 'admin'
+  let prevView = '';            // 上一视图，用于判断是否从后台进入写作
 
 
   function uid(p = 'id') {
@@ -79,12 +80,23 @@
   }
 
   // 读取容器：兼容 v1 单帖存档，自动迁移并留备份
+  // 注意：迁移只在读到时标记，写回延迟到首帧渲染之后。
+  // 旧版在这里同步改写 localStorage，一旦后续渲染抛错就留下「空壳存档」
+  // （帖子标题还在，但楼层/角色全没了），这就是那类只剩空帖的坏档来源。
+  let pendingRaw = null;
   function load() {
     let raw = null;
     try { raw = localStorage.getItem(LS_KEY); } catch (e) { /* 忽略 */ }
     if (!raw) return blankForum();
-    try { return adoptForum(JSON.parse(raw), { backupRaw: raw }); }
+    try { return adoptForum(JSON.parse(raw), { backupRaw: raw, deferBackup: true, raw }); }
     catch (e) { return blankForum(); }
+  }
+  // 首帧渲染成功后，才把迁移结果（含旧档备份）真正落盘
+  function commitMigration() {
+    if (!pendingRaw) return;
+    pendingRaw = null;
+    try { localStorage.setItem(LS_KEY, JSON.stringify(F)); } catch (e) { /* 忽略 */ }
+    save();
   }
   // 把任意形态的数据（容器 / 单帖 / 裸对象）还原成容器
   function adoptForum(raw, opts = {}) {
@@ -103,7 +115,8 @@
     else if (Array.isArray(data.floors)) {
       // v1 单帖存档 → 迁移成容器里的第一个帖子，原数据留一份备份
       if (opts.backupRaw) {
-        try { localStorage.setItem(LS_BACKUP, opts.backupRaw); } catch (e) { /* 忽略 */ }
+        if (opts.deferBackup) pendingRaw = opts.backupRaw;
+        else { try { localStorage.setItem(LS_BACKUP, opts.backupRaw); } catch (e) { /* 忽略 */ } }
       }
       posts = [adoptPost(data)];
     } else throw new Error('文件里没有楼层数据');
@@ -220,7 +233,8 @@
   }
   let saveTimer = null;
   function save() {
-    if (P) P.updatedAt = nowTime();
+    // 只有真正在写作界面才刷「最后编辑时间」，否则在后台新建/改标题也会被误标成刚编辑过
+    if (P && view === 'editor') P.updatedAt = nowTime();
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
       try { localStorage.setItem(LS_KEY, JSON.stringify(F)); }
@@ -448,8 +462,8 @@
       p.opText = p.opText ? p.opText + '\n' + (f.content || '') : (f.content || '');
       save(); renderPin(); renderPreview(); toast('已从第一楼导入');
     });
-    const addNoticeBtn = zone.querySelector('[data-op="pin-add-notice"]');
-    if (addNoticeBtn) addNoticeBtn.addEventListener('click', addNotice);
+    zone.querySelectorAll('[data-op="pin-add-notice"]').forEach(btn =>
+      btn.addEventListener('click', addNotice));
 
     zone.querySelectorAll('[data-op]').forEach(btn => {
       btn.addEventListener('click', () => {
@@ -802,25 +816,23 @@
     ta.addEventListener('input', fit);
   }
 
-  function setReplyTo(floor, r) {
-    const names = floor.replies
-      .map(x => ({ id: x.charId, name: charOf(x.charId) ? charOf(x.charId).name : '' }))
-      .filter(x => x.id && x.id !== r.charId);
-    const uniq = [];
-    const seen = new Set();
-    names.forEach(n => { if (!seen.has(n.id)) { seen.add(n.id); uniq.push(n); } });
-    const menu = ['<option value="">（不指定）</option>']
-      .concat(uniq.map(n => `<option value="${n.id}" ${r.toCharId === n.id ? 'selected' : ''}>${esc(n.name)}</option>`));
-    const pick = prompt('输入要 @ 的角色昵称（留空清除）：', r.toCharId && charOf(r.toCharId) ? charOf(r.toCharId).name : '');
-    if (pick === null) return;
-    if (!pick.trim()) { r.toCharId = ''; }
+  async function setReplyTo(floor, r) {
+    const cur = r.toCharId && charOf(r.toCharId) ? charOf(r.toCharId).name : '';
+    const pickName = await askText({
+      title: '指定要 @ 的角色',
+      tip: '填角色的显示昵称；留空表示取消 @。',
+      label: '昵称',
+      value: cur,
+      placeholder: '输入角色昵称',
+    });
+    if (pickName === null) return;
+    if (!pickName.trim()) { r.toCharId = ''; }
     else {
-      const found = P.chars.find(c => c.name === pick.trim());
+      const found = P.chars.find(c => c.name === pickName.trim());
       if (!found) { toast('未找到该昵称的角色'); return; }
       r.toCharId = found.id;
     }
     save(); renderFloors(); renderPreview();
-    void menu;
   }
 
   /* ---------- 楼层增删改 ---------- */
@@ -903,14 +915,22 @@
   }
 
   // 批量添加重复内容的回复（水军刷屏）：随机角色，可选自动新建
-  function batchReplies(floor) {
+  async function batchReplies(floor) {
     if (!floor) { toast('批量回复失败：未定位到楼层'); return; }
-    const content = prompt('批量回复的内容：', '');
-    if (content === null || !content.trim()) return;
-    const nStr = prompt('添加几条？', '10');
-    if (nStr === null) return;
-    const n = Math.max(1, Math.min(300, parseInt(nStr, 10) || 1));
-    const text = content.trim();
+    const res = await askText({
+      title: '批量回复',
+      tip: '同一个内容会重复添加多条，用来模拟刷屏。',
+      label: '回复内容',
+      value: '',
+      placeholder: '例如：+1 / 顶一个 / 已经笑不活了…',
+      multiline: true,
+      second: { label: '添加几条？（1–300）', value: '10' },
+    });
+    if (res === null) return;
+    const [rawContent, rawCount] = res;
+    if (!rawContent.trim()) { toast('内容为空，已取消'); return; }
+    const n = Math.max(1, Math.min(300, parseInt(rawCount, 10) || 1));
+    const text = rawContent.trim();
     const mode = P.batchChar || 'random';
     try {
       for (let k = 0; k < n; k++) {
@@ -1281,6 +1301,68 @@ h1{font-size:20px}.floor{display:flex;gap:10px;padding:12px 0;border-bottom:1px 
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => t.classList.add('hidden'), 2200);
   }
+
+  /* ---------- 通用输入弹窗（原生 prompt 在 Electron 里被禁用，必须自带） ----------
+     askText(opts) → Promise<string|null>
+       opts = { title, tip, label, value, placeholder, multiline, second:{label,value,placeholder,type} }
+     返回：单输入时是字符串；带 second 时是 [第一个, 第二个] 数组；取消为 null。 */
+  let dlgResolve = null;
+  function askText(opts = {}) {
+    return new Promise(resolve => {
+      dlgResolve = resolve;
+      $('#dlgTitle').textContent = opts.title || '输入';
+      const tip = $('#dlgTip');
+      tip.textContent = opts.tip || '';
+      tip.classList.toggle('hidden', !opts.tip);
+      $('#dlgLabel').textContent = opts.label || '内容';
+      const inp = $('#dlgInput');
+      inp.rows = opts.multiline ? 4 : 1;
+      $('#dlgModal').dataset.multiline = opts.multiline ? '1' : '';
+      inp.value = opts.value == null ? '' : String(opts.value);
+      inp.placeholder = opts.placeholder || '';
+      const f2 = $('#dlgField2');
+      if (opts.second) {
+        f2.classList.remove('hidden');
+        $('#dlgLabel2').textContent = opts.second.label || '';
+        const i2 = $('#dlgInput2');
+        i2.type = opts.second.type || 'text';
+        i2.value = opts.second.value == null ? '' : String(opts.second.value);
+        i2.placeholder = opts.second.placeholder || '';
+      } else {
+        f2.classList.add('hidden');
+        $('#dlgInput2').value = '';
+      }
+      $('#dlgModal').classList.remove('hidden');
+      setTimeout(() => { inp.focus(); if (inp.select) inp.select(); }, 0);
+    });
+  }
+  function closeDialog(val) {
+    $('#dlgModal').classList.add('hidden');
+    $('#dlgOk').disabled = false;
+    $('#dlgCancel').disabled = false;
+    const r = dlgResolve;
+    dlgResolve = null;
+    if (r) r(val);
+  }
+  function bindDialog() {
+    $('#dlgOk').addEventListener('click', () => {
+      const has2 = !$('#dlgField2').classList.contains('hidden');
+      const v1 = $('#dlgInput').value;
+      // 防抖：确认后到 Promise 回调执行前，按钮短暂禁用，避免连点重复提交
+      $('#dlgOk').disabled = true;
+      $('#dlgCancel').disabled = true;
+      setTimeout(() => closeDialog(has2 ? [v1, $('#dlgInput2').value] : v1), 0);
+    });
+    $('#dlgCancel').addEventListener('click', () => closeDialog(null));
+    $('#dlgModal').addEventListener('click', e => { if (e.target.id === 'dlgModal') closeDialog(null); });
+    $('#dlgInput').addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey && $('#dlgModal').dataset.multiline !== '1') { e.preventDefault(); $('#dlgOk').click(); }
+    });
+    $('#dlgInput2').addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); $('#dlgOk').click(); }
+    });
+  }
+
   function copyText(text) {
     if (navigator.clipboard && window.isSecureContext) {
       return navigator.clipboard.writeText(text);
@@ -1369,9 +1451,10 @@ h1{font-size:20px}.floor{display:flex;gap:10px;padding:12px 0;border-bottom:1px 
     $('#cSave').addEventListener('click', saveChar);
     $('#charModal').addEventListener('click', e => { if (e.target.id === 'charModal') $('#charModal').classList.add('hidden'); });
     document.addEventListener('keydown', e => {
-      if (e.key === 'Escape') { $('#charModal').classList.add('hidden'); $('#setModal').classList.add('hidden'); $('#aboutModal').classList.add('hidden'); }
+      if (e.key === 'Escape') { $('#charModal').classList.add('hidden'); $('#setModal').classList.add('hidden'); $('#aboutModal').classList.add('hidden'); $('#dlgModal').classList.add('hidden'); }
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !$('#charModal').classList.contains('hidden')) saveChar();
     });
+    bindDialog();
 
     // 导入按钮
     $('#btnImport').addEventListener('click', () => $('#fileInput').click());
@@ -1600,9 +1683,10 @@ h1{font-size:20px}.floor{display:flex;gap:10px;padding:12px 0;border-bottom:1px 
   }
 
   function postRowHTML(p) {
-    const dis = p === P ? '' : ' disabled';
-    const op = p.chars.find(c => c.op);
-    return `<div class="post-row${p === P ? ' is-active' : ''}" data-id="${p.id}">
+    // 正在写的这一帖只做高亮，按钮不禁用：P 仅在首次加载和「写这篇」时更新，
+    // 一旦禁用，用户在后台新建/切换帖子后就再也点不动任何「写这篇」了
+    const isCur = !!(P && p.id === P.id);
+    return `<div class="post-row${isCur ? ' is-active' : ''}" data-id="${p.id}">
       <div class="pr-main">
         <div class="pr-title">
           ${p.mod.status ? `<span class="badge ${p.mod.status === '置顶' ? 'hot' : p.mod.status === '精华' ? 'good' : ''}">${esc(p.mod.status)}</span>` : ''}
@@ -1627,7 +1711,7 @@ h1{font-size:20px}.floor{display:flex;gap:10px;padding:12px 0;border-bottom:1px 
           `<option value="${s}"${s === p.mod.status ? ' selected' : ''}>${s || '普通'}</option>`).join('')}</select></label>
       </div>
       <div class="pr-ops">
-        <button class="btn mini" data-act="open"${dis} title="${dis ? '当前正在写这一帖' : '用写作界面打开这一帖'}">✍️ 写这篇</button>
+        <button class="btn mini" data-act="open" title="用写作界面打开这一帖">✍️ 写这篇${isCur ? '（当前）' : ''}</button>
         <button class="btn mini ghost" data-act="related" title="设置相关帖子（用于目录内互链）">🔗 相关 ${p.relatedIds.length || ''}</button>
         <button class="btn mini ghost" data-act="standalone" title="把这一帖导出为单帖存档，方便单独分享">单独导出</button>
         <button class="btn mini ghost" data-act="lock" title="锁帖：锁上后写作界面只读，防止误改">${p.locked ? '🔒 已锁' : '🔓 锁帖'}</button>
@@ -1925,7 +2009,8 @@ h1{font-size:20px}.floor{display:flex;gap:10px;padding:12px 0;border-bottom:1px 
 
   /* ---------- 启动 ---------- */
   function renderAll() {
-    const fromAdmin = view === 'editor' && F.ui.mode === 'admin';
+    const fromAdmin = !!prevView && prevView === 'admin' && view === 'editor';
+    prevView = view;
     $('#workTitle').value = P.title || '';
     $('#btnToggleTime').textContent = '排序：' + (P.sortMode === 'time' ? '按时间' : '手动');
     const bar = $('#editorBar');
@@ -1934,6 +2019,7 @@ h1{font-size:20px}.floor{display:flex;gap:10px;padding:12px 0;border-bottom:1px 
     if (fromAdmin) $('#editorBarText').textContent = `正在写：${P.title || '（未命名帖子）'} · ${boardName(P.boardId)}`;
     renderChars(); renderPin(); renderFloors(); renderPreview();
     applyLockState();
+    commitMigration();
   }
   // 视图切换：写作（三栏编辑器）/ 管理（版主后台）
   function setView(v) {
