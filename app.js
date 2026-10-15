@@ -5,6 +5,7 @@
   const LS_KEY = 'forum-writer-project-v1';
   const $ = (s) => document.querySelector(s);
   const $$ = (s) => Array.from(document.querySelectorAll(s));
+  const PALETTE = ['#5b8def', '#e0654c', '#3bab8a', '#b06ad6', '#e8a53c', '#5d6b8a', '#d45d92', '#4aa3c7'];
 
   /* ---------- 数据模型 ---------- */
   // project = {
@@ -193,30 +194,36 @@
   }
 
   /* ---------- 随机角色（词库存于 P.lex，可在设置里编辑） ---------- */
-  function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+  // 抽词兜底：空数组 / 非数组也不会抽出 undefined（undefined 会污染角色名与后续渲染）
+  function pick(arr) {
+    if (!Array.isArray(arr) || !arr.length) return '';
+    return arr[Math.floor(Math.random() * arr.length)];
+  }
+  function lexOf(k) {
+    const v = P.lex && P.lex[k];
+    return Array.isArray(v) && v.length ? v : defaultLex()[k];
+  }
   function randomName() {
-    const L = P.lex;
     const r = Math.random();
-    if (r < 0.34) return pick(L.pre) + pick(L.mid);
-    if (r < 0.62) return pick(L.mid) + pick(L.suf);
-    if (r < 0.82) return pick(L.pre) + pick(L.nb);
-    return pick(L.pre) + pick(L.mid) + pick(L.suf);
+    if (r < 0.34) return pick(lexOf('pre')) + pick(lexOf('mid'));
+    if (r < 0.62) return pick(lexOf('mid')) + pick(lexOf('suf'));
+    if (r < 0.82) return pick(lexOf('pre')) + pick(lexOf('nb'));
+    return pick(lexOf('pre')) + pick(lexOf('mid')) + pick(lexOf('suf'));
   }
   function makeRandomChar() {
-    const name = randomName();
+    const name = randomName() || '匿名用户';
     return {
       id: uid('c'), name, uid: randomUid(), avatar: name.slice(-1) || name.slice(0, 1),
-      color: randomColor(), title: pick(P.lex.title), note: '', anon: false,
+      color: randomColor(), title: pick(lexOf('title')), note: '', anon: false,
     };
   }
   function randomUid() {
-    const L = P.lex;
     const style = Math.floor(Math.random() * 3);
-    if (style === 0) return pick(L.uidPre) + '_' + Math.floor(Math.random() * 9000 + 1000);
+    if (style === 0) return pick(lexOf('uidPre')) + '_' + Math.floor(Math.random() * 9000 + 1000);
     if (style === 1) return Math.floor(Math.random() * 900000 + 100000) + '';
-    return pick(L.uidPre) + Math.floor(Math.random() * 900 + 100);
+    return pick(lexOf('uidPre')) + Math.floor(Math.random() * 900 + 100);
   }
-  function randomColor() { return pick(PALETTE); }
+  function randomColor() { return pick(PALETTE) || PALETTE[0]; }
   function fillRandomChar() {
     const name = randomName();
     $('#cName').value = name;
@@ -229,7 +236,6 @@
 
   /* ---------- 角色弹窗 ---------- */
   let editingCharId = null;
-  const PALETTE = ['#5b8def', '#e0654c', '#3bab8a', '#b06ad6', '#e8a53c', '#5d6b8a', '#d45d92', '#4aa3c7'];
   function openCharModal(id) {
     editingCharId = id || null;
     const c = id ? charOf(id) : null;
@@ -788,24 +794,36 @@
 
   // 批量添加重复内容的回复（水军刷屏）：随机角色，可选自动新建
   function batchReplies(floor) {
+    if (!floor) { toast('批量回复失败：未定位到楼层'); return; }
     const content = prompt('批量回复的内容：', '');
     if (content === null || !content.trim()) return;
     const nStr = prompt('添加几条？', '10');
     if (nStr === null) return;
     const n = Math.max(1, Math.min(300, parseInt(nStr, 10) || 1));
+    const text = content.trim();
     const mode = P.batchChar || 'random';
-    const pool = P.chars.length ? P.chars.map(c => c.id) : [];
-    for (let k = 0; k < n; k++) {
-      let cid;
-      if (mode === 'same') cid = floor.charId || (pool[0] || '');
-      else if (mode === 'distinct') {
-        if (P.chars.length < 30 && Math.random() < 0.7) { const c = makeRandomChar(); P.chars.push(c); cid = c.id; }
-        else if (pool.length) cid = pool[Math.floor(Math.random() * pool.length)];
-        else { const c = makeRandomChar(); P.chars.push(c); cid = c.id; }
-      } else {
-        cid = pool.length ? pool[Math.floor(Math.random() * pool.length)] : (() => { const c = makeRandomChar(); P.chars.push(c); return c.id; })();
+    try {
+      for (let k = 0; k < n; k++) {
+        let cid;
+        if (mode === 'same') {
+          cid = floor.charId || (P.chars[0] && P.chars[0].id);
+        } else if (mode === 'distinct') {
+          // 尽量各不相同：角色不足时自动新建，否则随机复用现有角色
+          if (P.chars.length < 30 && (P.chars.length < n || Math.random() < 0.7)) {
+            const c = makeRandomChar(); P.chars.push(c); cid = c.id;
+          } else {
+            cid = pick(P.chars.map(c => c.id));
+          }
+        } else {
+          cid = P.chars.length ? pick(P.chars.map(c => c.id)) : '';
+        }
+        // 池里没有可用角色（0 个角色，或「全部同一个人」但楼层未指定马甲）→ 现造一个并入池
+        if (!cid) { const c = makeRandomChar(); P.chars.push(c); cid = c.id; }
+        floor.replies.push({ id: uid('r'), charId: cid, toCharId: '', content: text, images: [] });
       }
-      floor.replies.push({ id: uid('r'), charId: cid, toCharId: '', content: content.trim(), images: [] });
+    } catch (err) {
+      toast('批量回复出错：' + err.message);
+      return;
     }
     floor.repOpen = true;  // 直接展开，方便核对
     save(); renderChars(); renderFloors(); renderPreview();

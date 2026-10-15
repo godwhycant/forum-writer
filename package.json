@@ -1,6 +1,6 @@
 {
   "name": "forum-writer",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "论坛体写作助手 —— 离线可用的论坛体排版工具",
   "main": "main.js",
   "author": "godwhycant <weiweierhong@outlook.com>",
@@ -34,11 +34,16 @@
           "arch": [
             "x64"
           ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "icon": "build/icon.ico",
-      "signAndEditExecutable": false,
-      "artifactName": "${productName}-${version}-安装包.${ext}"
+      "signAndEditExecutable": false
     },
     "nsis": {
       "oneClick": false,

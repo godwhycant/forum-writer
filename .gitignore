@@ -3,6 +3,7 @@ node_modules/
 
 # 构建产物（体积大，可随时重新生成）
 dist/
+dist-*/
 release/
 
 # 日志与缓存
